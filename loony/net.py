@@ -11,17 +11,19 @@ import pymbolic.primitives as P
 ctx = cl.create_some_context()
 queue = cl.CommandQueue(ctx)
 
-EPSILON = 0.001
+EPSILON = 0.01
 
 class KernelCall(object):
     def __init__(self, queue, kernel):
         self._queue = queue
-        kernel = lp.set_options(kernel, 'write_cl')
+        #kernel = lp.set_options(kernel, 'write_cl')
         self._kernel = kernel
 
     def __call__(self, *args, **kw):
         evt, result = self._kernel(self._queue, *args, **kw)
-        return result[0]
+        if len(result) == 1:
+            return result[0]
+        return result
 
 def fprop_cost():
     """
@@ -126,7 +128,7 @@ def softmax_fprop():
     '''
     Compute the softmax of `input_array` (e^x_i) / sum(e^x_i for all i).
     '''
-    return lp.make_kernel(
+    knl = lp.make_kernel(
         """{ [i,j,k]:
             0<=i<n and
             0<=j<n and
@@ -135,10 +137,13 @@ def softmax_fprop():
         """,
         instructions=[
             'exp[i] = E ** in_batch[i]',
-            'total = sum(j, exp[j])',
+            '<float32> total = sum(j, exp[j])',
             'out[k] = exp[k] / total'
         ],
         assumptions="n>0")
+
+    knl = lp.set_options(knl, 'write_cl')
+    return knl
 
 def softmax_bprop():
     return lp.make_kernel(
@@ -170,7 +175,7 @@ class Network(object):
 
     def fprop(self, in_batch):
         for layer in self.layers:
-            print 'IN:', in_batch
+            #print 'IN:', in_batch
             in_batch = layer.fprop(in_batch)
 
     def bprop(self, cost):
@@ -182,7 +187,7 @@ class Network(object):
             layer.update()
 
     def train(self, input_reader):
-        for i in range(1):
+        for i in range(1000):
             data, correct = input_reader.next()
 
             # predictions is a #classes vector
@@ -192,7 +197,9 @@ class Network(object):
             self.fprop(data)
             predictions = cost_layer.predictions
             errors = cost_layer.errors
-            print np.sum(errors)
+            if i % 10 == 0:
+                print 'P:', predictions
+                print 'Correct?', np.argmax(predictions), correct, 'Total error:', np.sum(errors ** 2)
             self.bprop(errors)
             self.update()
 
@@ -222,8 +229,9 @@ class FullyConnectedLayer(Layer):
 
     def _fprop(self, in_batch):
         if  self._weights is None:
-            self._weights = np.random.randn(in_batch.shape[0], self._output_size).astype(np.float32)
-            self._bias = np.random.randn(self._output_size).astype(np.float32)
+            self._weights = np.random.randn(in_batch.shape[0], self._output_size).astype(np.float32) / (
+                    self._output_size * in_batch.shape[0])
+            self._bias = np.random.randn(self._output_size).astype(np.float32) / self._output_size
 
         self._in_batch = in_batch
         return self._fprop_kernel(weights=self._weights, in_batch=in_batch, bias=self._bias)
@@ -243,7 +251,8 @@ class SoftMaxLayer(Layer):
         self._bprop_kernel = KernelCall(queue, softmax_bprop())
 
     def _fprop(self, in_batch):
-        return self._fprop_kernel(in_batch=in_batch, E=np.float32(math.e))
+        exp, pred =  self._fprop_kernel(in_batch=in_batch, E=np.float32(math.e))
+        return pred
 
     def _bprop(self, d_out):
         return self._bprop_kernel(d_cost_d_out=d_out)
@@ -264,6 +273,7 @@ class CostLayer(Layer):
         correct[self.actual] = 1
 
         self.predictions = in_batch
+
         self.errors = self._fprop_kernel(in_batch=in_batch, correct=correct)
         return self.errors
 
