@@ -3,33 +3,53 @@ import loopy as lp
 import pyopencl as cl
 import pyopencl.array
 
-def softmax(input_array):
-  '''
-  Compute the softmax of `input_array` (e^x_i) / sum(e^x_i for all i).
-  '''
-  exp_kernel = lp.make_kernel(
-      ''' { [i]: 0<=i<n } ''',
-     ''' out[i] = pow(E, z[i])''',
-     assumptions="n>0")
 
-  sum_kernel = lp.make_kernel(
-      '{ [i]: 0<=i<n }',
-      'out = sum(i, exp[i])',
-      assumptions='n>0]')
+def softmax(queue, input_array):
+    '''
+    Compute the softmax of `input_array` (e^x_i) / sum(e^x_i for all i)self.
+    '''
+    exp_kernel = lp.make_kernel(
+      name="exp",
+      domains=[
+        '{ [i]: 0<=i<n }',
+      ],
+      instructions=[
+        'out_exp[i] = z[i]',
+      ],
+      assumptions="n>0")
 
-  softmax_kernel = lp.make_kernel(
-      '{ [i]: 0<=i<n }',
-      'out[i] = exp[i] / total',
+    sum_kernel = lp.make_kernel(
+      name="sum",
+      domains=[
+        '{ [i]: 0<=i<n }',
+      ],
+      instructions=[
+        'out_sum = sum(i, exp[i])',
+      ],
       assumptions='n>0')
 
-  evt, (exp,) = exp_kernel(z=input_array)
-  evt, (sum_exp,) = sum_kernel(exp=exp)
-  evt, (softmax,) = softmax_kernel(exp=exp, total=sum_exp)
+    softmax_divide_kernel = lp.make_kernel(
+      name="softmax_divide",
+      domains=[
+        '{ [i]: 0<=i<n }',
+      ],
+      instructions=[
+        'out_final[i] = exp[i] / total',
+      ],
+      assumptions='n>0')
+    print(exp_kernel)
+    print(sum_kernel)
+    print(softmax_divide_kernel)
+    evt, (exp,) = exp_kernel(queue, z=input_array, E=2.7)
+    evt, (sum_exp,) = sum_kernel(queue, exp=exp)
+    evt, (softmax,) = softmax_divide_kernel(queue, exp=exp, total=sum_exp)
 
-  return softmax
+    return softmax
 
-def tanh_activation(input_array):
-  return _activation('tanh', input_array)
-
-def relu_activation(input_array):
-  return _activation('relu', input_array)
+if __name__ == "__main__":
+    ctx = cl.create_some_context()
+    queue = cl.CommandQueue(ctx)
+    x = np.array([1, 2, 3])
+    y = softmax(queue, x)
+    print("-- x: %s" % (x,))
+    print("-- y: %s" % (y,))
