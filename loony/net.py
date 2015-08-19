@@ -11,6 +11,8 @@ import pymbolic.primitives as P
 ctx = cl.create_some_context()
 queue = cl.CommandQueue(ctx)
 
+NUM_BATCHES = 10000
+DEBUG = False
 EPSILON = 0.01
 
 class KernelCall(object):
@@ -105,11 +107,11 @@ def fc_bprop_input():
     """
     Given: dCost/dOut
     Compute: dCost/dIn via dCost/dOut * dOut/dIn.
-    dOut/dIn[i, j] = w[i,j]
 
-    dOut/dIn is just the weight matrix!
+    dOut/dIn is just the weight matrix.
+    dOut/dIn[i, j] = w[i,j]
     """
-    return lp.make_kernel(
+    knl = lp.make_kernel(
         domains="""
         { [i, j]:
            0<=i<input_len and
@@ -123,6 +125,8 @@ def fc_bprop_input():
         ],
         assumptions="output_len,input_len>0"
     )
+    knl = lp.set_options(knl, 'write_cl')
+    return knl
 
 def softmax_fprop():
     '''
@@ -141,29 +145,55 @@ def softmax_fprop():
             'out[k] = exp[k] / total'
         ],
         assumptions="n>0")
-
-    knl = lp.set_options(knl, 'write_cl')
     return knl
 
 def softmax_bprop():
+    '''
+    Softmax bprop:
+
+    If you do this out, dOut/dIn is actually expressed most simply in the
+    form of `out`:
+
+    dOut_i/dIn_j = {
+      In_j * (1 - In_j) [ i == j]
+      - In_i * In_j [i != j]
+    }
+
+    As I don't know how to express a ternary condition like that in loopy,
+    I'm factoring the i == j case out.
+
+    In practice, we'd combine softmax with a log-likelihood cost function, which
+    when multiplied together results in a very simple expression for dCost/dIn:
+    (prediction_i - correct_i), e.g. the negative error for the prediction.
+    '''
     return lp.make_kernel(
-        """{ [i]: 0<=i<n } """,
+        """{ [i,j]: 0<=i<n and 0<=j<n } """,
         instructions=[
-            'out[i] = d_cost_d_out[i]'
+          'd_cost_d_in[i] = -d_cost_d_out[i] * out[i] + sum(j, -out[i] * out[j] * d_cost_d_out[j])'
+         # 'd_cost_d_in[i] = -d_cost_d_out[i]'
         ],
         assumptions="n>0")
 
 class Reader(object):
-    def __init__(self, np_array):
-        self._data = np_array
+    def __init__(self, bunch):
+        np.set_printoptions(precision=4, linewidth=120)
+        np.random.seed(42)
+        shuffle_idx = np.random.permutation(len(bunch.data))
+        self._data = bunch.data[shuffle_idx].astype(np.float32)
+        self._target = bunch.target[shuffle_idx]
+
+        # de-mean data and normalize to [-1, 1]
+        self._data -= np.mean(self._data)
+        self._data /= np.max(np.abs(self._data))
+
         self._idx = 0
 
     def next(self):
-        idx = self._idx
+        data = self._data[self._idx]
+        classes = self._target[self._idx]
         self._idx += 1
-        data = self._data.data[idx].astype(np.float32)
-        data = (data / 16.0) - 0.5
-        classes = self._data.target[idx]
+        if self._idx >= len(self._data):
+            self._idx = 0
         return data, classes
 
 class Network(object):
@@ -178,16 +208,18 @@ class Network(object):
             #print 'IN:', in_batch
             in_batch = layer.fprop(in_batch)
 
-    def bprop(self, cost):
+    def bprop(self, d_cost_d_out):
         for layer in reversed(self.layers):
-            cost = layer.bprop(cost)
+            d_cost_d_out = layer.bprop(d_cost_d_out)
 
     def update(self):
         for layer in self.layers:
             layer.update()
 
     def train(self, input_reader):
-        for i in range(1000):
+        correct_count = 0
+
+        for i in range(NUM_BATCHES):
             data, correct = input_reader.next()
 
             # predictions is a #classes vector
@@ -197,9 +229,15 @@ class Network(object):
             self.fprop(data)
             predictions = cost_layer.predictions
             errors = cost_layer.errors
-            if i % 10 == 0:
-                print 'P:', predictions
-                print 'Correct?', np.argmax(predictions), correct, 'Total error:', np.sum(errors ** 2)
+            if np.argmax(predictions) == correct:
+                correct_count += 1
+
+            if i % 100 == 0:
+                print 'batch.%05d: P(correct)=%s' % (i, correct_count/100.)
+                correct_count = 0
+            #print 'Last example:', predictions, correct, errors
+
+            d_cost_d_p = -2 * errors
             self.bprop(errors)
             self.update()
 
@@ -210,6 +248,7 @@ class Layer(object):
         return self._fprop(in_batch)
 
     def bprop(self, d_out):
+        #print d_out
         return self._bprop(d_out)
 
     def update(self):
@@ -229,6 +268,8 @@ class FullyConnectedLayer(Layer):
 
     def _fprop(self, in_batch):
         if  self._weights is None:
+            # initialize weights and biases from a normal distribution
+            # scale down to keep avg(output) = avg(input)
             self._weights = np.random.randn(in_batch.shape[0], self._output_size).astype(np.float32) / (
                     self._output_size * in_batch.shape[0])
             self._bias = np.random.randn(self._output_size).astype(np.float32) / self._output_size
@@ -239,7 +280,8 @@ class FullyConnectedLayer(Layer):
     def _bprop(self, d_out):
         self._w_grad = self._bprop_w(d_cost_d_out=d_out, in_batch=self._in_batch)
         self._b_grad = self._bprop_b(d_cost_d_out=d_out)
-        return self._bprop_in(d_cost_d_out=d_out, weights=self._weights)
+        result = self._bprop_in(d_cost_d_out=d_out, weights=self._weights)
+        return result
 
     def _update(self, epsilon=EPSILON):
         self._weights -= self._w_grad * epsilon
@@ -251,11 +293,16 @@ class SoftMaxLayer(Layer):
         self._bprop_kernel = KernelCall(queue, softmax_bprop())
 
     def _fprop(self, in_batch):
-        exp, pred =  self._fprop_kernel(in_batch=in_batch, E=np.float32(math.e))
-        return pred
+        exp, self.pred =  self._fprop_kernel(in_batch=in_batch, E=np.float32(math.e))
+        return self.pred
 
     def _bprop(self, d_out):
-        return self._bprop_kernel(d_cost_d_out=d_out)
+        d_cost_d_in = self._bprop_kernel(d_cost_d_out=d_out, out=self.pred)
+        if DEBUG:
+            print 'ERR', d_out
+            print 'OUT', self.pred
+            print 'COST/X', d_cost_d_in
+        return d_cost_d_in
 
     def _update(self):
         pass
@@ -263,7 +310,6 @@ class SoftMaxLayer(Layer):
 class CostLayer(Layer):
     def __init__(self):
         self._fprop_kernel = KernelCall(queue, fprop_cost())
-        #self._bprop_kernel = KernelCall(queue, bprop_cost())
 
     def set_actual(self, actual):
         self.actual = actual
@@ -273,27 +319,29 @@ class CostLayer(Layer):
         correct[self.actual] = 1
 
         self.predictions = in_batch
-
-        self.errors = self._fprop_kernel(in_batch=in_batch, correct=correct)
+        self.errors = self.predictions - correct
+        self.cost = np.sum(self.errors ** 2)
         return self.errors
 
-    def _bprop(self, d_out):
-        return d_out
+    def _bprop(self, errors):
+        return -2 * self.errors
 
     def _update(self):
         pass
 
 
-def build(hidden1_size=100, hidden2_size=10):
+def build(hidden1_size=250, hidden2_size=10):
     net = Network()
     net.add(FullyConnectedLayer(hidden1_size))
-    net.add(FullyConnectedLayer(hidden2_size))
+    if hidden2_size > 0:
+        net.add(FullyConnectedLayer(hidden2_size))
     net.add(SoftMaxLayer())
     net.add(CostLayer())
     return net
 
 if __name__ == "__main__":
-    from sklearn.datasets import load_digits
+    from sklearn.datasets import load_digits, load_iris
     digits = load_digits()
-    network = build()
+    iris = load_iris()
+    network = build(hidden2_size=10)
     network.train(Reader(digits))
