@@ -1,7 +1,6 @@
 import numpy as np
 import loopy as lp
 import pyopencl as cl
-import pyopencl.array
 
 
 def softmax(queue, input_array):
