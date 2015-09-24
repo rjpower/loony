@@ -1,6 +1,9 @@
+from __future__ import print_function
+
 import time
 import numpy as np
 import loopy as lp
+import pyopencl as cl
 from loony.util import time_op
 
 class Optimizer(object):
@@ -20,7 +23,7 @@ class Optimizer(object):
 
         data = {}
         for name, shape in size_hints.iteritems():
-            data[name] = np.ndarray(shape, dtype=np.float32)
+            data[name] = cl.array.zeros(self._queue, shape, dtype=np.float32)
 
         return data
 
@@ -29,9 +32,12 @@ class Optimizer(object):
         # Run the operation twice; the first time we actually generate the
         # kernel and compiled it, which we don't want to charge for.
         # TODO: generate kernel explicitly, instead of running the operation twice...
+        knl(self._queue, **self._example_data)
+        st = time.time()
         evt, result = knl(self._queue, **self._example_data)
-        (evt, result), elapsed = time_op(lambda: knl(self._queue, **self._example_data))
-        return elapsed
+        evt.wait()
+        ed = time.time()
+        return ed - st
 
     def opt(self, knl, inames):
         if not inames:
@@ -43,6 +49,7 @@ class Optimizer(object):
         best = (None, [], 1e6)
         for unroll_factor in [2, 4, 8]:
             split_knl = lp.split_iname(knl, iname, unroll_factor, inner_tag="unr")
+            # print('DIM', knl.cache_manager.dim_min(0))
             # TODO: find mapping from iname to the domain variable that
             # constraint it.  I'd like to inject assumptions on the size of the
             # input, e.g.
@@ -50,6 +57,7 @@ class Optimizer(object):
 
             # we track the choices made by the optimizer in a silly way for now
             res, choices, elapsed = self.opt(split_knl, inames)
+            print('Split:', iname, elapsed)
             if elapsed < best[2]:
                 best = (res,
                         choices + ['iname=%s unroll=%d ' % (iname, unroll_factor)],

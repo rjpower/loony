@@ -1,5 +1,7 @@
 #!/usr/bin/env python
 
+from __future__ import print_function
+
 import numpy as np
 import loopy as lp
 import pyopencl as cl
@@ -11,6 +13,13 @@ from loony.dense import dense_fprop
 from loony.util import time_op
 
 N = 1024
+
+def blocking_knl(knl):
+    def _new_call(*args, **kw):
+        evt, result = knl(*args, **kw)
+        evt.wait()
+        return result
+    return _new_call
 
 def test_optimization():
     platform = cl.get_platforms()[0]
@@ -27,19 +36,19 @@ def test_optimization():
     optimized_knl, choices=\
             optimize(knl, queue=queue, size_hints={ 'in_batch': (N,), 'weights': (N, N), 'bias': N })
 
-    in_batch = np.ones(N, dtype=np.float32)
-    weights = np.ones((N, N), dtype=np.float32)
-    bias = np.ones(N, dtype=np.float32)
+    in_batch = cl.array.zeros(queue, N, dtype=np.float32)
+    weights = cl.array.zeros(queue, (N, N), dtype=np.float32)
+    bias = cl.array.zeros(queue, N, dtype=np.float32)
 
-    print 'Optimization choices:', choices
+    knl = blocking_knl(knl)
+    optimized_knl = blocking_knl(optimized_knl)
+    print('Optimization choices:', choices)
     for i in range(10):
-        (evt, result), naive_time = time_op(
+        result, naive_time = time_op(
             lambda: knl(queue, in_batch=in_batch, weights=weights, bias=bias))
-        evt.wait()
-        (evt, result), optimized_time = time_op(
+        result, optimized_time = time_op(
             lambda: optimized_knl(queue, in_batch=in_batch, weights=weights, bias=bias))
-        evt.wait()
-        print 'Time:', naive_time, optimized_time, 'Speedup:', naive_time / optimized_time
+        print('Time:', naive_time, optimized_time, 'Speedup:', naive_time / optimized_time)
 
 if __name__ == '__main__':
     test_optimization()
